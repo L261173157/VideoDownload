@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\":*)",
+      "Bash(python:*)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" -c \"from downloader.video_downloader import VideoDownloader; print\\(''VideoDownloader module imported successfully''\\)\")",
+      "Bash(powershell:*)",
+      "Bash(taskkill:*)"
+    ]
+  }
+}
