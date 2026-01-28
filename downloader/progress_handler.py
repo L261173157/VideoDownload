@@ -6,8 +6,6 @@ class ProgressHandler:
 
     def __init__(self):
         self.progress_callback = None
-        self._downloaded_bytes = 0
-        self._total_bytes = 0
 
     def set_callback(self, callback):
         """

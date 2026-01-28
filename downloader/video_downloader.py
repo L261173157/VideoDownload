@@ -19,6 +19,12 @@ class VideoDownloader:
         # 延迟导入M3U8Downloader，避免循环导入
         self._m3u8_downloader = None
 
+        # 临时Cookie文件路径（用于清理）
+        self._temp_cookie_file = None
+
+        # 代理设置
+        self.proxy = None
+
     @property
     def m3u8_downloader(self):
         """延迟加载M3U8下载器"""
@@ -54,9 +60,46 @@ class VideoDownloader:
         """
         self.progress_handler.set_callback(callback)
 
+    def set_proxy(self, proxy_url):
+        """
+        设置代理服务器
+
+        Args:
+            proxy_url: 代理URL，支持以下格式：
+                      - 完整格式: 'http://127.0.0.1:7890'
+                      - 简短格式: '127.0.0.1:7890' (自动识别为HTTP)
+                      - SOCKS格式: 'socks5://127.0.0.1:1080'
+                      留空表示不使用代理
+        """
+        self.proxy = proxy_url.strip() if proxy_url else None
+        
+        if self.proxy:
+            # 自动识别协议：如果没有指定协议，默认使用http://
+            if not any(self.proxy.startswith(p) for p in ['http://', 'https://', 'socks4://', 'socks5://']):
+                # 检查是否包含端口
+                if ':' in self.proxy:
+                    # 有端口，添加http://前缀
+                    self.proxy = f'http://{self.proxy}'
+                    self.logger.info(f"自动识别为HTTP代理: {self.proxy}")
+                else:
+                    # 没有端口，可能是错误的格式
+                    self.logger.warning(f"代理格式可能不正确（缺少端口）: {self.proxy}")
+            
+            self.logger.info(f"已设置代理: {self.proxy}")
+            # 同时设置M3U8下载器的代理
+            if self._m3u8_downloader:
+                self._m3u8_downloader.set_proxy(self.proxy)
+        else:
+            self.logger.info("已禁用代理")
+            # 同时清除M3U8下载器的代理
+            if self._m3u8_downloader:
+                self._m3u8_downloader.set_proxy(None)
+
+        return self.proxy
+
     def get_video_info(self, url, use_m3u8_fallback=True, cookie=None):
         """
-        获取视频信息（不下载）
+        获取视频信息
 
         Args:
             url: 视频URL
@@ -153,6 +196,10 @@ class VideoDownloader:
                     raise Exception(f"获取视频信息失败:\nyt-dlp错误: {str(e)}\nM3U8错误: {str(m3u8_error)}")
             else:
                 raise Exception(f"获取视频信息失败: {str(e)}")
+        finally:
+            # 清理临时Cookie文件
+            if cookie:
+                self._cleanup_cookie_file()
 
     def _get_m3u8_video_info(self, url, cookie=None):
         """使用M3U8下载器获取视频信息（增强错误处理）"""
@@ -325,6 +372,10 @@ class VideoDownloader:
                 'is_m3u8': False,
                 'direct_mp4_url': mp4_url
             }
+        finally:
+            # 清理临时Cookie文件
+            if cookie:
+                self._cleanup_cookie_file()
 
     def download_video(self, url, output_path='.', quality='best', video_info=None, cookie=None):
         """
@@ -350,10 +401,16 @@ class VideoDownloader:
         if video_info and video_info.get('is_m3u8'):
             return self._download_m3u8_video(video_info.get('m3u8_info'), output_path, cookie=cookie)
 
-        # 如果提供了video_info且包含直接MP4 URL，使用直接下载
+        # 如果提供了video_info且包含直接MP4 URL，优先使用直接下载（绕过代理问题）
         if video_info and video_info.get('direct_mp4_url'):
-            self.logger.info(f"使用直接MP4 URL下载: {video_info['direct_mp4_url']}")
-            return self._download_with_ytdlp(video_info['direct_mp4_url'], output_path, quality, cookie=cookie)
+            self.logger.info(f"检测到直接MP4 URL，尝试直接下载")
+            # 先尝试直接下载（绕过yt-dlp和代理限制）
+            try:
+                return self._download_direct_mp4(video_info['direct_mp4_url'], output_path, video_info.get('title', 'video'))
+            except Exception as direct_error:
+                self.logger.warning(f"直接下载失败，尝试使用yt-dlp: {str(direct_error)}")
+                # 如果直接下载失败，降级到yt-dlp
+                return self._download_with_ytdlp(video_info['direct_mp4_url'], output_path, quality, cookie=cookie)
 
         # 格式化输出路径
         if not output_path.endswith('/') and not output_path.endswith('\\'):
@@ -414,50 +471,198 @@ class VideoDownloader:
 
     def _download_with_ytdlp(self, url, output_path, quality, cookie=None):
         """使用yt-dlp下载视频"""
-        ydl_opts = {
-            'outtmpl': f'{output_path}%(title)s.%(ext)s',
-            'format': self._get_format_string(quality),
-            'progress_hooks': [self.progress_handler.progress_hook],
-            'quiet': True,
-            'no_warnings': True,
-        }
+        try:
+            ydl_opts = {
+                'outtmpl': f'{output_path}%(title)s.%(ext)s',
+                'format': self._get_format_string(quality),
+                'progress_hooks': [self.progress_handler.progress_hook],
+                'quiet': True,
+                'no_warnings': True,
+            }
 
-        # 如果提供了Cookie，添加到yt-dlp选项
-        if cookie:
-            ydl_opts['cookiefile'] = self._create_cookie_file(cookie)
-            self.logger.info("已将Cookie添加到yt-dlp下载请求")
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            self.logger.info("正在调用 yt-dlp 下载...")
-            info = ydl.extract_info(url, download=True)
-
-            self.logger.info(f"下载完成，视频标题: {info.get('title', '未知')}")
-
-            # 获取下载后的文件名
-            filename = ydl.prepare_filename(info)
-            self.logger.debug(f"准备文件名: {filename}")
-
-            # 检查文件是否实际存在
-            if not os.path.exists(filename):
-                self.logger.warning(f"文件不存在: {filename}")
-                # 尝试查找可能的文件名变体
-                directory = os.path.dirname(filename) or '.'
-                title = info.get('title', '')
-                # 尝试匹配可能的文件
-                for ext in ['.mp4', '.webm', '.mkv', '.m4a']:
-                    possible_file = os.path.join(directory, f"{title}{ext}")
-                    if os.path.exists(possible_file):
-                        filename = possible_file
-                        self.logger.info(f"找到实际文件: {filename}")
-                        break
+            # 如果设置了代理，添加到yt-dlp选项
+            if self.proxy:
+                ydl_opts['proxy'] = self.proxy
+                self.logger.info(f"使用代理: {self.proxy}")
             else:
-                self.logger.info(f"确认文件存在: {filename}")
+                self.logger.info("不使用代理")
+
+            # 如果提供了Cookie，添加到yt-dlp选项
+            if cookie:
+                ydl_opts['cookiefile'] = self._create_cookie_file(cookie)
+                self.logger.info("已将Cookie添加到yt-dlp下载请求")
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                self.logger.info("正在调用 yt-dlp 下载...")
+                info = ydl.extract_info(url, download=True)
+
+                self.logger.info(f"下载完成，视频标题: {info.get('title', '未知')}")
+
+                # 获取下载后的文件名
+                filename = ydl.prepare_filename(info)
+                self.logger.debug(f"准备文件名: {filename}")
+
+                # 检查文件是否实际存在
+                if not os.path.exists(filename):
+                    self.logger.warning(f"文件不存在: {filename}")
+                    # 尝试查找可能的文件名变体
+                    directory = os.path.dirname(filename) or '.'
+                    title = info.get('title', '')
+                    # 尝试匹配可能的文件
+                    for ext in ['.mp4', '.webm', '.mkv', '.m4a']:
+                        possible_file = os.path.join(directory, f"{title}{ext}")
+                        if os.path.exists(possible_file):
+                            filename = possible_file
+                            self.logger.info(f"找到实际文件: {filename}")
+                            break
+                else:
+                    self.logger.info(f"确认文件存在: {filename}")
+
+                return {
+                    'success': True,
+                    'filename': filename,
+                    'title': info.get('title', '未知标题')
+                }
+        finally:
+            # 清理临时Cookie文件
+            if cookie:
+                self._cleanup_cookie_file()
+
+    def _download_direct_mp4(self, mp4_url, output_path, filename='video'):
+        """
+        直接下载MP4文件（绕过yt-dlp和代理限制）
+
+        Args:
+            mp4_url: MP4视频URL
+            output_path: 保存路径
+            filename: 文件名（不含扩展名）
+
+        Returns:
+            dict: 下载结果
+        """
+        import requests
+        import time
+        from pathlib import Path
+
+        self.logger.info(f"开始直接下载MP4: {mp4_url}")
+        self.logger.info(f"保存路径: {output_path}")
+        self.logger.info(f"文件名: {filename}")
+
+        # 确保输出目录存在
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+
+        # 构造完整文件路径
+        output_file = os.path.join(output_path, f"{filename}.mp4")
+
+        try:
+            # 发起请求
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://91porn.com/',
+                'Accept': '*/*',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            }
+
+            # 如果设置了代理，使用代理下载
+            proxies = None
+            if self.proxy:
+                proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
+                self.logger.info(f"使用代理下载: {self.proxy}")
+            else:
+                self.logger.info("不使用代理直接下载")
+
+            # 获取文件大小
+            response = requests.head(mp4_url, headers=headers, proxies=proxies, timeout=30, allow_redirects=True)
+            total_size = int(response.headers.get('content-length', 0))
+            self.logger.info(f"文件大小: {total_size / (1024 * 1024):.2f} MB")
+
+            # 流式下载
+            response = requests.get(mp4_url, headers=headers, proxies=proxies, stream=True, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+
+            downloaded = 0
+            start_time = time.time()
+            last_update_time = start_time
+
+            with open(output_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # 更新进度（每秒更新一次）
+                        current_time = time.time()
+                        if current_time - last_update_time >= 0.5:  # 每0.5秒更新一次
+                            percentage = (downloaded / total_size * 100) if total_size > 0 else 0
+
+                            # 计算速度
+                            elapsed = current_time - start_time
+                            speed = 0.0  # 初始化speed
+                            if elapsed > 0:
+                                speed = downloaded / elapsed / (1024 * 1024)  # MB/s
+                                speed_str = f"{speed:.2f} MB/s"
+                            else:
+                                speed_str = "0 MB/s"
+
+                            # 计算ETA
+                            if total_size > 0 and speed > 0:
+                                remaining = total_size - downloaded
+                                eta = remaining / (speed * 1024 * 1024)  # 秒
+                                if eta > 60:
+                                    eta_str = f"{int(eta / 60)} min"
+                                else:
+                                    eta_str = f"{int(eta)} sec"
+                            else:
+                                eta_str = "N/A"
+
+                            # 格式化文件大小
+                            size_str = f"{downloaded / (1024 * 1024):.1f} MB"
+                            if total_size > 0:
+                                size_str += f" / {total_size / (1024 * 1024):.1f} MB"
+
+                            # 调用进度回调
+                            if self.progress_handler.progress_callback:
+                                self.progress_handler.progress_callback(
+                                    downloaded,
+                                    total_size,
+                                    percentage,
+                                    speed_str,
+                                    eta_str,
+                                    size_str
+                                )
+
+                            last_update_time = current_time
+
+            # 最终更新进度为100%
+            if self.progress_handler.progress_callback:
+                self.progress_handler.progress_callback(
+                    total_size,
+                    total_size,
+                    100,
+                    "完成",
+                    "0 sec",
+                    f"{total_size / (1024 * 1024):.1f} MB"
+                )
+
+            self.logger.info(f"直接下载完成: {output_file}")
 
             return {
                 'success': True,
-                'filename': filename,
-                'title': info.get('title', '未知标题')
+                'filename': output_file,
+                'title': filename
             }
+
+        except requests.exceptions.RequestException as e:
+            error_msg = f"直接下载失败: {type(e).__name__}: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            raise Exception(error_msg)
+        except Exception as e:
+            error_msg = f"直接下载失败: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            raise Exception(error_msg)
 
     def _download_m3u8_video(self, m3u8_info, output_path, cookie=None):
         """使用M3U8下载器下载视频"""
@@ -542,6 +747,9 @@ class VideoDownloader:
         import tempfile
         import os
 
+        # 先清理旧的临时文件
+        self._cleanup_cookie_file()
+
         # 创建临时文件
         fd, temp_path = tempfile.mkstemp(suffix='.txt', text=True)
 
@@ -565,6 +773,8 @@ class VideoDownloader:
                             # Netscape格式: domain \t flag \t path \t secure \t expiration \t name \t value
                             f.write(f".\tTRUE\t/\tFALSE\t0\t{name.strip()}\t{value.strip()}\n")
 
+            # 保存临时文件路径以便后续清理
+            self._temp_cookie_file = temp_path
             self.logger.info(f"已创建临时Cookie文件: {temp_path}")
             return temp_path
 
@@ -573,9 +783,22 @@ class VideoDownloader:
             # 如果创建失败，返回None，yt-dlp会忽略它
             try:
                 os.unlink(temp_path)
-            except:
+            except (OSError, FileNotFoundError):
+                # 文件可能已被删除或无法访问，忽略错误
                 pass
             return None
+
+    def _cleanup_cookie_file(self):
+        """
+        清理临时Cookie文件
+        """
+        if self._temp_cookie_file and os.path.exists(self._temp_cookie_file):
+            try:
+                os.unlink(self._temp_cookie_file)
+                self.logger.info(f"已清理临时Cookie文件: {self._temp_cookie_file}")
+                self._temp_cookie_file = None
+            except Exception as e:
+                self.logger.warning(f"清理Cookie文件失败: {str(e)}")
 
     def cancel_download(self):
         """

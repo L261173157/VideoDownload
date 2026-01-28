@@ -14,7 +14,6 @@ class MainWindow:
     def __init__(self, root):
         self.root = root
         self.root.title("视频下载器")
-        self.root.geometry("700x650")
         self.root.resizable(True, True)
 
         # 初始化下载器和验证器
@@ -97,6 +96,29 @@ class MainWindow:
                               font=('Arial', 8), foreground='gray')
         help_label.pack(anchor=tk.W, pady=(5, 0))
 
+        # ===== 代理设置 =====
+        proxy_frame = ttk.LabelFrame(self.root, text="代理设置（可选）", padding=10)
+        proxy_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        proxy_input_frame = ttk.Frame(proxy_frame)
+        proxy_input_frame.pack(fill=tk.X)
+
+        ttk.Label(proxy_input_frame, text="代理:").pack(side=tk.LEFT, padx=(0, 5))
+
+        self.proxy_entry = ttk.Entry(proxy_input_frame)
+        self.proxy_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        
+        # 设置默认代理为空（不使用代理）
+        self.proxy_entry.insert(0, "")
+
+        ttk.Button(proxy_input_frame, text="应用", command=self.apply_proxy, style='Action.TButton').pack(side=tk.LEFT)
+        ttk.Button(proxy_input_frame, text="清除", command=self.clear_proxy, style='Action.TButton').pack(side=tk.LEFT, padx=(5, 0))
+
+        # 添加帮助提示
+        proxy_help_label = ttk.Label(proxy_frame, text="提示: 格式如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080，留空则不使用代理",
+                                     font=('Arial', 8), foreground='gray')
+        proxy_help_label.pack(anchor=tk.W, pady=(5, 0))
+
         # ===== 保存路径选择 =====
         path_frame = ttk.LabelFrame(self.root, text="保存设置", padding=10)
         path_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -115,8 +137,9 @@ class MainWindow:
         if not os.path.exists(default_path):
             try:
                 os.makedirs(default_path)
-            except:
-                default_path = os.getcwd()  # 如果创建失败，使用当前目录
+            except (OSError, PermissionError) as e:
+                # 如果创建失败（权限不足或其他文件系统错误），使用当前目录
+                default_path = os.getcwd()
 
         self.path_entry.insert(0, default_path)
 
@@ -329,6 +352,36 @@ class MainWindow:
     def get_cookie(self):
         """获取Cookie字符串"""
         return self.cookie_entry.get().strip()
+
+    def apply_proxy(self):
+        """
+        应用代理设置
+        """
+        proxy = self.proxy_entry.get().strip()
+        
+        if not proxy:
+            messagebox.showwarning("警告", "请输入代理地址")
+            return
+
+        # 设置代理到下载器（会自动识别格式）
+        self.downloader.set_proxy(proxy)
+        
+        # 获取最终的代理地址（可能已被自动添加协议前缀）
+        final_proxy = self.downloader.proxy
+        
+        # 显示成功消息
+        if proxy == final_proxy:
+            self.log_message(f"已应用代理设置: {proxy}", 'SUCCESS')
+        else:
+            self.log_message(f"已应用代理设置: {proxy} → {final_proxy}", 'SUCCESS')
+
+    def clear_proxy(self):
+        """
+        清除代理设置
+        """
+        self.proxy_entry.delete(0, tk.END)
+        self.downloader.set_proxy(None)
+        self.log_message("已清除代理设置", 'INFO')
 
     def start_download(self):
         """开始下载"""

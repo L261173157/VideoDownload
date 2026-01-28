@@ -29,9 +29,17 @@ class M3U8Downloader:
         self.progress_handler = ProgressHandler()
         self.logger = get_logger()
         self.session = requests.Session()
+        self.proxy = None  # 代理设置
 
         # 设置默认超时（从20增加到30秒）
         self.timeout = 30
+
+        # 设置下载延迟范围（秒）- 降低延迟提升下载速度
+        self.delay_min = 0.1  # 最小延迟
+        self.delay_max = 0.3  # 最大延迟
+
+        # 设置默认M3U8 CDN基础URL（可配置）
+        self.m3u8_cdn_base = "https://la3.killcovid2021.com"
 
         # 设置请求头（模拟真实浏览器）
         self.headers = {
@@ -51,7 +59,7 @@ class M3U8Downloader:
 
         self.session.headers.update(self.headers)
         self.custom_cookie = None  # 自定义Cookie
-        self.logger.info("M3U8Downloader 初始化 (超时: 30s, 增强重试)")
+        self.logger.info("M3U8Downloader 初始化 (超时: 30s, 延迟: 0.1-0.3s)")
 
     def set_progress_callback(self, callback):
         """
@@ -86,6 +94,51 @@ class M3U8Downloader:
             self.logger.info(f"已设置自定义Cookie: {len(cookie_dict)} 个cookie")
         else:
             self.logger.info("清空自定义Cookie")
+
+    def set_proxy(self, proxy_url):
+        """
+        设置代理服务器
+
+        Args:
+            proxy_url: 代理URL，格式如 'http://127.0.0.1:7890'
+                      留空或None表示不使用代理
+        """
+        self.proxy = proxy_url.strip() if proxy_url else None
+        
+        if self.proxy:
+            # 设置代理到session
+            self.session.proxies = {
+                'http': self.proxy,
+                'https': self.proxy
+            }
+            self.logger.info(f"已设置代理: {self.proxy}")
+        else:
+            # 清除代理
+            self.session.proxies = None
+            self.logger.info("已禁用代理")
+
+    def set_download_delay(self, min_delay=0.1, max_delay=0.3):
+        """
+        设置下载片段之间的延迟时间
+
+        Args:
+            min_delay: 最小延迟（秒），默认0.1
+            max_delay: 最大延迟（秒），默认0.3
+        """
+        self.delay_min = max(0, min_delay)  # 确保不为负数
+        self.delay_max = max(self.delay_min, max_delay)  # 确保max >= min
+        self.logger.info(f"已设置下载延迟: {self.delay_min}-{self.delay_max}秒")
+
+    def set_m3u8_cdn_base(self, cdn_base_url):
+        """
+        设置M3U8 CDN基础URL
+
+        Args:
+            cdn_base_url: CDN基础URL（例如：https://la3.killcovid2021.com）
+        """
+        # 移除末尾的斜杠
+        self.m3u8_cdn_base = cdn_base_url.rstrip('/')
+        self.logger.info(f"已设置M3U8 CDN基础URL: {self.m3u8_cdn_base}")
 
     def _extract_viewkey_from_url(self, page_url):
         """
@@ -315,7 +368,7 @@ class M3U8Downloader:
         Returns:
             dict: M3U8信息
         """
-        m3u8_url = f"https://la3.killcovid2021.com/m3u8/{video_id}/{video_id}.m3u8"
+        m3u8_url = f"{self.m3u8_cdn_base}/m3u8/{video_id}/{video_id}.m3u8"
         self.logger.info(f"正在获取M3U8文件: {m3u8_url}")
 
         m3u8_text = self._request_content(m3u8_url, is_text=True, max_retries=3)
@@ -421,74 +474,77 @@ class M3U8Downloader:
         total_ts = len(ts_list)
         downloaded_ts = 0
         failed_ts = []
-
-        # 下载所有TS片段
-        for index, ts_file in enumerate(ts_list, 1):
-            ts_filename = os.path.join(temp_folder, f"{ts_file}")
-
-            # 构造TS文件URL
-            if base_url:
-                ts_url = base_url + ts_file
-            else:
-                # 使用原始的URL格式
-                ts_url = f"https://la3.killcovid2021.com/m3u8/{video_id}/{ts_file}"
-
-            try:
-                self.logger.info(f"正在下载 [{index}/{total_ts}]: {ts_file}")
-
-                # 更新进度
-                progress_percentage = (index - 1) / total_ts * 100
-                self.progress_handler.progress_hook({
-                    'downloaded_bytes': index - 1,
-                    'total_bytes': total_ts,
-                    'status': 'downloading',
-                    'speed': 'N/A',
-                    'eta': 'N/A'
-                })
-
-                content = self._request_content(ts_url)
-
-                if content:
-                    # 保存TS文件
-                    with open(ts_filename, "wb") as f:
-                        f.write(content)
-
-                    downloaded_ts += 1
-                    self.logger.info(f"下载完成 [{index}/{total_ts}]: {ts_file}")
-
-                    # 随机延迟，避免请求过快被封
-                    sleep_time = random.uniform(0.5, 2.0)
-                    time.sleep(sleep_time)
-                else:
-                    failed_ts.append(ts_file)
-                    self.logger.warning(f"下载失败: {ts_file}")
-
-            except Exception as e:
-                failed_ts.append(ts_file)
-                self.logger.error(f"下载TS文件失败 [{ts_file}]: {str(e)}")
-
-        # 更新完成进度
-        self.progress_handler.progress_hook({
-            'downloaded_bytes': total_ts,
-            'total_bytes': total_ts,
-            'status': 'finished',
-            'speed': 'N/A',
-            'eta': 'N/A'
-        })
-
-        # 合并TS文件
         output_file = None
-        if merge and downloaded_ts > 0:
-            output_file = os.path.join(output_path, f"{video_id}.mp4")
-            self._merge_ts_files(temp_folder, output_file, ts_list)
 
-            # 清理临时文件
-            try:
-                import shutil
-                shutil.rmtree(temp_folder)
-                self.logger.info(f"已清理临时文件夹: {temp_folder}")
-            except Exception as e:
-                self.logger.warning(f"清理临时文件夹失败: {str(e)}")
+        try:
+            # 下载所有TS片段
+            for index, ts_file in enumerate(ts_list, 1):
+                ts_filename = os.path.join(temp_folder, f"{ts_file}")
+
+                # 构造TS文件URL
+                if base_url:
+                    ts_url = base_url + ts_file
+                else:
+                    # 使用CDN基础URL（可配置）
+                    ts_url = f"{self.m3u8_cdn_base}/m3u8/{video_id}/{ts_file}"
+
+                try:
+                    self.logger.info(f"正在下载 [{index}/{total_ts}]: {ts_file}")
+
+                    # 更新进度
+                    progress_percentage = (index - 1) / total_ts * 100
+                    self.progress_handler.progress_hook({
+                        'downloaded_bytes': index - 1,
+                        'total_bytes': total_ts,
+                        'status': 'downloading',
+                        'speed': 'N/A',
+                        'eta': 'N/A'
+                    })
+
+                    content = self._request_content(ts_url)
+
+                    if content:
+                        # 保存TS文件
+                        with open(ts_filename, "wb") as f:
+                            f.write(content)
+
+                        downloaded_ts += 1
+                        self.logger.info(f"下载完成 [{index}/{total_ts}]: {ts_file}")
+
+                        # 随机延迟，避免请求过快被封（使用配置的延迟时间）
+                        sleep_time = random.uniform(self.delay_min, self.delay_max)
+                        time.sleep(sleep_time)
+                    else:
+                        failed_ts.append(ts_file)
+                        self.logger.warning(f"下载失败: {ts_file}")
+
+                except Exception as e:
+                    failed_ts.append(ts_file)
+                    self.logger.error(f"下载TS文件失败 [{ts_file}]: {str(e)}")
+
+            # 更新完成进度
+            self.progress_handler.progress_hook({
+                'downloaded_bytes': total_ts,
+                'total_bytes': total_ts,
+                'status': 'finished',
+                'speed': 'N/A',
+                'eta': 'N/A'
+            })
+
+            # 合并TS文件
+            if merge and downloaded_ts > 0:
+                output_file = os.path.join(output_path, f"{video_id}.mp4")
+                self._merge_ts_files(temp_folder, output_file, ts_list)
+
+        finally:
+            # 无论成功失败，都清理临时文件（仅在merge=True时）
+            if merge and os.path.exists(temp_folder):
+                try:
+                    import shutil
+                    shutil.rmtree(temp_folder)
+                    self.logger.info(f"已清理临时文件夹: {temp_folder}")
+                except Exception as e:
+                    self.logger.warning(f"清理临时文件夹失败: {str(e)}")
 
         return {
             'success': len(failed_ts) == 0,
